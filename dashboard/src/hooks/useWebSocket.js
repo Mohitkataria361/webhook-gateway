@@ -5,7 +5,13 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-const WS_URL = `ws://${window.location.host}/ws/logs`;
+const getWsUrl = () => {
+  if (import.meta.env.VITE_WS_URL) {
+    return import.meta.env.VITE_WS_URL;
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/logs`;
+};
 
 export function useWebSocket() {
   const [logs, setLogs] = useState([]);
@@ -15,7 +21,7 @@ export function useWebSocket() {
   const reconnectTimer = useRef(null);
 
   const connect = useCallback(() => {
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(getWsUrl());
     wsRef.current = ws;
 
     ws.onopen = () => {

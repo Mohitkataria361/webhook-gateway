@@ -24,6 +24,9 @@ WORKDIR /app
 COPY --from=builder /bin/api ./api
 COPY --from=builder /bin/worker ./worker
 
+# Copy the SQL migrations folder so the API can read them on startup
+COPY --from=builder /app/internal/db/migrations ./internal/db/migrations
+
 # Expose the API port
 EXPOSE 8080
 

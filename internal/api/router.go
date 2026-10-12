@@ -32,26 +32,49 @@ func SetupRouter(
 	app.Use(middleware.CORS())
 
 	// Instantiate handlers.
+	authH := handler.NewAuthHandler(db, cfg)
 	endpointH := handler.NewEndpointHandler(db)
 	webhookH := handler.NewWebhookHandler(db, rc, mq, cfg)
-	wsH := handler.NewWebSocketHandler(h)
+	wsH := handler.NewWebSocketHandler(db, h, cfg)
+
+	// Admin / API Key generation (can be called by dashboard / developers)
+	app.Post("/api/admin/generate-key", authH.GenerateKey)
 
 	// REST API routes.
 	v1 := app.Group("/api/v1")
 	{
-		// Endpoint registration.
-		v1.Post("/endpoints", endpointH.Register)
-		v1.Get("/endpoints", endpointH.List)
+		// Authentication & OAuth endpoints
+		authGroup := v1.Group("/auth")
+		{
+			authGroup.Get("/config", authH.Config)
+			authGroup.Get("/github", authH.LoginGitHub)
+			authGroup.Get("/github/callback", authH.CallbackGitHub)
+			authGroup.Get("/google", authH.LoginGoogle)
+			authGroup.Get("/google/callback", authH.CallbackGoogle)
+			authGroup.Post("/dev-login", authH.DevLogin)
+			authGroup.Post("/keys", authH.GenerateKey)
 
-		// Webhook event ingestion.
-		v1.Post("/webhooks/send", webhookH.Send)
+			// Current authenticated user info
+			authGroup.Get("/me", middleware.RequireAuth(db, cfg.JWTSecret), authH.Me)
+		}
 
-		// Delivery history + replay.
-		v1.Get("/events/:id/deliveries", webhookH.GetDeliveries)
-		v1.Post("/events/:id/replay", webhookH.Replay)
+		// Protected endpoints (require API key or JWT authentication)
+		protected := v1.Group("", middleware.RequireAuth(db, cfg.JWTSecret))
+		{
+			// Webhook endpoints ("Hooks")
+			protected.Post("/endpoints", endpointH.Register)
+			protected.Get("/endpoints", endpointH.List)
+			protected.Delete("/endpoints/:id", endpointH.Delete)
+
+			// Webhook sending and logs
+			protected.Post("/webhooks/send", webhookH.Send)
+			protected.Get("/logs", webhookH.GetLogs)
+			protected.Get("/events/:id/deliveries", webhookH.GetDeliveries)
+			protected.Post("/events/:id/replay", webhookH.Replay)
+		}
 	}
 
-	// WebSocket route for live log streaming.
+	// WebSocket route for live log streaming (token validated in UpgradeMiddleware).
 	app.Use("/ws/logs", wsH.UpgradeMiddleware)
 	app.Get("/ws/logs", websocket.New(wsH.Handle))
 

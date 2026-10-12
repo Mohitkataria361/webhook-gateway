@@ -1,25 +1,60 @@
-import React from 'react';
+import React, { useState, useMemo } from 'react';
 import LogRow from './LogRow';
 import { useWebSocket } from '../hooks/useWebSocket';
 
 /**
- * LogStream — live delivery log table streaming from the WebSocket hub.
+ * LogStream — isolated delivery log table streaming from the WebSocket hub.
  */
-export default function LogStream() {
-  const { logs, connected, error, clearLogs } = useWebSocket();
+export default function LogStream({ token, user }) {
+  const { logs, connected, error, loadingHistory, refreshHistory, clearLogs } = useWebSocket(token);
+  const [filterStatus, setFilterStatus] = useState('ALL');
+  const [searchTerm, setSearchTerm] = useState('');
+
+  const filteredLogs = useMemo(() => {
+    return logs.filter((item) => {
+      if (filterStatus !== 'ALL' && item.status !== filterStatus) {
+        return false;
+      }
+      if (searchTerm.trim()) {
+        const term = searchTerm.toLowerCase();
+        const matchesEvent = item.event_id?.toLowerCase().includes(term);
+        const matchesUrl = item.target_url?.toLowerCase().includes(term);
+        const matchesEndpoint = item.endpoint_id?.toLowerCase().includes(term);
+        if (!matchesEvent && !matchesUrl && !matchesEndpoint) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [logs, filterStatus, searchTerm]);
+
+  const statuses = ['ALL', 'SUCCESS', 'FAILED', 'CIRCUIT_BROKEN', 'DLQ'];
 
   return (
     <section className="log-stream-section">
       <div className="log-stream-header">
         <div className="header-left">
-          <h2>Live Delivery Log</h2>
+          <div className="title-row">
+            <h2>Live Delivery Log</h2>
+            <span className="isolated-badge" title="Deliveries are isolated to your account">
+              🔒 Private Stream ({user?.email || 'Authenticated'})
+            </span>
+          </div>
           <span className={`connection-badge ${connected ? 'conn-live' : 'conn-offline'}`}>
             <span className={`conn-dot ${connected ? 'dot-live' : 'dot-offline'}`}></span>
-            {connected ? 'Connected' : 'Reconnecting…'}
+            {connected ? 'WebSocket Live' : 'Reconnecting…'}
           </span>
         </div>
+
         <div className="header-right">
-          <span className="log-count">{logs.length} events</span>
+          <button
+            className="btn-ghost"
+            onClick={refreshHistory}
+            disabled={loadingHistory}
+            title="Reload delivery history"
+          >
+            {loadingHistory ? '⏳ Loading…' : '↻ Refresh'}
+          </button>
           <button id="clear-logs-btn" className="clear-btn" onClick={clearLogs}>
             Clear
           </button>
@@ -32,6 +67,32 @@ export default function LogStream() {
         </div>
       )}
 
+      {/* ── Filters & Search ── */}
+      <div className="log-filters-bar">
+        <div className="filter-pills">
+          {statuses.map((st) => (
+            <button
+              key={st}
+              className={`filter-pill ${filterStatus === st ? 'active' : ''}`}
+              onClick={() => setFilterStatus(st)}
+            >
+              {st}
+            </button>
+          ))}
+        </div>
+        <div className="search-box">
+          <input
+            type="text"
+            placeholder="Search by Event ID or URL…"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
+          {searchTerm && (
+            <button className="search-clear" onClick={() => setSearchTerm('')}>✕</button>
+          )}
+        </div>
+      </div>
+
       <div className="table-wrapper">
         <table className="log-table">
           <thead>
@@ -42,20 +103,25 @@ export default function LogStream() {
               <th>Attempt</th>
               <th>HTTP</th>
               <th>Latency</th>
+              <th>Time</th>
               <th>Action</th>
             </tr>
           </thead>
           <tbody>
-            {logs.length === 0 ? (
+            {filteredLogs.length === 0 ? (
               <tr>
-                <td colSpan={7} className="empty-state">
-                  {connected
-                    ? '⏳ Waiting for webhook events…'
-                    : '🔌 Connecting to live stream…'}
+                <td colSpan={8} className="empty-state">
+                  {loadingHistory
+                    ? '⏳ Loading delivery history…'
+                    : logs.length === 0
+                    ? connected
+                      ? '⚡ Ready! Dispatch a webhook above to inspect live deliveries.'
+                      : '🔌 Connecting to your private live stream…'
+                    : 'No delivery logs match your filter.'}
                 </td>
               </tr>
             ) : (
-              logs.map((log) => <LogRow key={log.id} log={log} />)
+              filteredLogs.map((log) => <LogRow key={log.id || log.event_id} log={log} />)
             )}
           </tbody>
         </table>

@@ -182,6 +182,7 @@ func (d *Dispatcher) broadcastStatus(
 	errMsg *string,
 ) {
 	d.hub.Broadcast(hub.LogEvent{
+		UserID:          job.UserID,
 		EventID:         job.EventID,
 		EndpointID:      job.EndpointID,
 		TargetURL:       job.TargetURL,

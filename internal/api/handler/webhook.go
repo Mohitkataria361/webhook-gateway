@@ -15,7 +15,7 @@ import (
 	redisclient "webhook-gateway/internal/redis"
 )
 
-// WebhookHandler handles event ingestion and replay.
+// WebhookHandler handles event ingestion, deliveries, logs, and replay.
 type WebhookHandler struct {
 	db    *pgxpool.Pool
 	redis *redisclient.Client
@@ -37,13 +37,6 @@ type SendRequest struct {
 }
 
 // Send handles POST /api/v1/webhooks/send.
-//
-// Flow:
-//  1. Validate request body.
-//  2. Redis SETNX idempotency check (HTTP 409 on duplicate).
-//  3. Load endpoint config from PostgreSQL.
-//  4. Persist webhook_event record.
-//  5. Publish WebhookJob to RabbitMQ.
 func (h *WebhookHandler) Send(c *fiber.Ctx) error {
 	var req SendRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -69,7 +62,6 @@ func (h *WebhookHandler) Send(c *fiber.Ctx) error {
 	isNew, err := h.redis.SetIdempotency(ctx, req.IdempotencyKey)
 	if err != nil {
 		log.Printf("[webhook-handler] Redis idempotency error: %v", err)
-		// Fail open (log + continue) to avoid blocking on Redis outage.
 	}
 	if !isNew {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
@@ -78,14 +70,34 @@ func (h *WebhookHandler) Send(c *fiber.Ctx) error {
 		})
 	}
 
-	// --- Load endpoint config (URL + secret key) ---
-	var targetURL, secretKey string
-	err = h.db.QueryRow(ctx,
-		"SELECT target_url, secret_key FROM webhook_endpoints WHERE id = $1 AND is_active = TRUE",
-		endpointID,
-	).Scan(&targetURL, &secretKey)
-	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "endpoint not found or inactive"})
+	// --- Load endpoint config and check user ownership ---
+	var (
+		targetURL, secretKey string
+		endpointUserID       uuid.UUID
+	)
+
+	authUID, _ := c.Locals("user_id").(string)
+	if authUID != "" {
+		callerUID, err := uuid.Parse(authUID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id in token"})
+		}
+
+		err = h.db.QueryRow(ctx,
+			"SELECT target_url, secret_key, user_id FROM webhook_endpoints WHERE id = $1 AND user_id = $2 AND is_active = TRUE",
+			endpointID, callerUID,
+		).Scan(&targetURL, &secretKey, &endpointUserID)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "endpoint not found or not owned by you"})
+		}
+	} else {
+		err = h.db.QueryRow(ctx,
+			"SELECT target_url, secret_key, user_id FROM webhook_endpoints WHERE id = $1 AND is_active = TRUE",
+			endpointID,
+		).Scan(&targetURL, &secretKey, &endpointUserID)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "endpoint not found or inactive"})
+		}
 	}
 
 	// --- Persist the event ---
@@ -100,10 +112,11 @@ func (h *WebhookHandler) Send(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to persist event: " + err.Error()})
 	}
 
-	// --- Publish to RabbitMQ ---
+	// --- Publish to RabbitMQ with UserID ---
 	job := &queue.WebhookJob{
 		EventID:       eventID,
 		EndpointID:    endpointID.String(),
+		UserID:        endpointUserID.String(),
 		TargetURL:     targetURL,
 		SecretKey:     secretKey,
 		EventType:     req.EventType,
@@ -117,17 +130,17 @@ func (h *WebhookHandler) Send(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to queue event"})
 	}
 
-	log.Printf("[webhook-handler] Enqueued event %s (type=%s, endpoint=%s)", eventID, req.EventType, req.EndpointID)
+	log.Printf("[webhook-handler] Enqueued event %s (user=%s, type=%s, endpoint=%s)", eventID, endpointUserID, req.EventType, req.EndpointID)
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-		"event_id":  eventID,
-		"status":    "PENDING",
-		"message":   "Webhook event accepted and queued for delivery",
+		"event_id": eventID,
+		"status":   "PENDING",
+		"message":  "Webhook event accepted and queued for delivery",
 	})
 }
 
 // GetDeliveries handles GET /api/v1/events/:id/deliveries.
-// Returns all delivery attempts for a given event ID.
+// Returns delivery attempts for a given event ID owned by the user.
 func (h *WebhookHandler) GetDeliveries(c *fiber.Ctx) error {
 	eventIDStr := c.Params("id")
 	eventID, err := uuid.Parse(eventIDStr)
@@ -138,29 +151,42 @@ func (h *WebhookHandler) GetDeliveries(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rows, err := h.db.Query(ctx, `
-		SELECT id, event_id, attempt_number, http_status, response_body,
-		       execution_time_ms, status, error_message, delivered_at
-		FROM webhook_deliveries
-		WHERE event_id = $1
-		ORDER BY attempt_number ASC`,
-		eventID,
-	)
+	authUID, _ := c.Locals("user_id").(string)
+	query := `
+		SELECT d.id, d.event_id, d.attempt_number, d.http_status, d.response_body,
+		       d.execution_time_ms, d.status, d.error_message, d.delivered_at
+		FROM webhook_deliveries d
+		JOIN webhook_events e ON d.event_id = e.id
+		JOIN webhook_endpoints ep ON e.endpoint_id = ep.id
+		WHERE event_id = $1`
+
+	args := []interface{}{eventID}
+	if authUID != "" {
+		callerUID, err := uuid.Parse(authUID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id in token"})
+		}
+		query += " AND ep.user_id = $2"
+		args = append(args, callerUID)
+	}
+	query += " ORDER BY attempt_number ASC"
+
+	rows, err := h.db.Query(ctx, query, args...)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	defer rows.Close()
 
 	type DeliveryRow struct {
-		ID              string     `json:"id"`
-		EventID         string     `json:"event_id"`
-		AttemptNumber   int        `json:"attempt_number"`
-		HTTPStatus      *int       `json:"http_status"`
-		ResponseBody    *string    `json:"response_body"`
-		ExecutionTimeMS *int       `json:"execution_time_ms"`
-		Status          string     `json:"status"`
-		ErrorMessage    *string    `json:"error_message"`
-		DeliveredAt     time.Time  `json:"delivered_at"`
+		ID              string    `json:"id"`
+		EventID         string    `json:"event_id"`
+		AttemptNumber   int       `json:"attempt_number"`
+		HTTPStatus      *int      `json:"http_status"`
+		ResponseBody    *string   `json:"response_body"`
+		ExecutionTimeMS *int      `json:"execution_time_ms"`
+		Status          string    `json:"status"`
+		ErrorMessage    *string   `json:"error_message"`
+		DeliveredAt     time.Time `json:"delivered_at"`
 	}
 
 	var deliveries []DeliveryRow
@@ -178,8 +204,70 @@ func (h *WebhookHandler) GetDeliveries(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"event_id": eventID, "deliveries": deliveries, "count": len(deliveries)})
 }
 
+// GetLogs handles GET /api/v1/logs.
+// Returns historical delivery logs strictly scoped to the authenticated user's endpoints.
+func (h *WebhookHandler) GetLogs(c *fiber.Ctx) error {
+	authUID, _ := c.Locals("user_id").(string)
+	if authUID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	callerUID, err := uuid.Parse(authUID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id"})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rows, err := h.db.Query(ctx, `
+		SELECT d.id, d.event_id, e.endpoint_id, ep.target_url, d.attempt_number,
+		       d.http_status, d.response_body, d.execution_time_ms, d.status,
+		       d.error_message, d.delivered_at
+		FROM webhook_deliveries d
+		JOIN webhook_events e ON d.event_id = e.id
+		JOIN webhook_endpoints ep ON e.endpoint_id = ep.id
+		WHERE ep.user_id = $1
+		ORDER BY d.delivered_at DESC
+		LIMIT 100`,
+		callerUID,
+	)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	defer rows.Close()
+
+	type LogItem struct {
+		ID              string    `json:"id"`
+		EventID         string    `json:"event_id"`
+		EndpointID      string    `json:"endpoint_id"`
+		TargetURL       string    `json:"target_url"`
+		AttemptNumber   int       `json:"attempt_number"`
+		HTTPStatus      *int      `json:"http_status"`
+		ResponseBody    *string   `json:"response_body"`
+		ExecutionTimeMS *int      `json:"execution_time_ms"`
+		Status          string    `json:"status"`
+		ErrorMessage    *string   `json:"error_message"`
+		DeliveredAt     time.Time `json:"delivered_at"`
+	}
+
+	var logsList []LogItem
+	for rows.Next() {
+		var l LogItem
+		if err := rows.Scan(
+			&l.ID, &l.EventID, &l.EndpointID, &l.TargetURL, &l.AttemptNumber,
+			&l.HTTPStatus, &l.ResponseBody, &l.ExecutionTimeMS, &l.Status,
+			&l.ErrorMessage, &l.DeliveredAt,
+		); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		logsList = append(logsList, l)
+	}
+
+	return c.JSON(fiber.Map{"logs": logsList, "count": len(logsList)})
+}
+
 // Replay handles POST /api/v1/events/:id/replay.
-// Re-queues an existing event into RabbitMQ for re-delivery.
+// Re-queues an existing event owned by the authenticated user.
 func (h *WebhookHandler) Replay(c *fiber.Ctx) error {
 	eventIDStr := c.Params("id")
 	eventID, err := uuid.Parse(eventIDStr)
@@ -190,20 +278,33 @@ func (h *WebhookHandler) Replay(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Fetch event + endpoint details for re-delivery.
-	var (
-		evtIDStr, endpointIDStr, eventType, targetURL, secretKey string
-		payload                                                   json.RawMessage
-	)
-	err = h.db.QueryRow(ctx, `
-		SELECT e.id, e.endpoint_id, e.event_type, e.payload, ep.target_url, ep.secret_key
+	authUID, _ := c.Locals("user_id").(string)
+	query := `
+		SELECT e.id, e.endpoint_id, ep.user_id, e.event_type, e.payload, ep.target_url, ep.secret_key
 		FROM webhook_events e
 		JOIN webhook_endpoints ep ON ep.id = e.endpoint_id
-		WHERE e.id = $1`,
-		eventID,
-	).Scan(&evtIDStr, &endpointIDStr, &eventType, &payload, &targetURL, &secretKey)
+		WHERE e.id = $1`
+
+	args := []interface{}{eventID}
+	if authUID != "" {
+		callerUID, err := uuid.Parse(authUID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id in token"})
+		}
+		query += " AND ep.user_id = $2"
+		args = append(args, callerUID)
+	}
+
+	var (
+		evtIDStr, endpointIDStr, eventType, targetURL, secretKey string
+		endpointUserID                                           uuid.UUID
+		payload                                                  json.RawMessage
+	)
+	err = h.db.QueryRow(ctx, query, args...).Scan(
+		&evtIDStr, &endpointIDStr, &endpointUserID, &eventType, &payload, &targetURL, &secretKey,
+	)
 	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found"})
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "event not found or not owned by you"})
 	}
 
 	// Reset event status to PENDING.
@@ -212,6 +313,7 @@ func (h *WebhookHandler) Replay(c *fiber.Ctx) error {
 	job := &queue.WebhookJob{
 		EventID:       evtIDStr,
 		EndpointID:    endpointIDStr,
+		UserID:        endpointUserID.String(),
 		TargetURL:     targetURL,
 		SecretKey:     secretKey,
 		EventType:     eventType,
@@ -224,6 +326,6 @@ func (h *WebhookHandler) Replay(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to re-queue event"})
 	}
 
-	log.Printf("[webhook-handler] Replayed event %s", evtIDStr)
+	log.Printf("[webhook-handler] Replayed event %s for user %s", evtIDStr, endpointUserID)
 	return c.JSON(fiber.Map{"event_id": evtIDStr, "status": "PENDING", "message": "Event re-queued for replay"})
 }

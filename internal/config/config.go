@@ -25,15 +25,24 @@ type Config struct {
 	RabbitMQURL string
 
 	// Application
-	APIPort            string
-	WorkerConcurrency  int
-	MaxRetries         int
-	BaseDelayMS        int
+	APIPort           string
+	WorkerConcurrency int
+	MaxRetries        int
+	BaseDelayMS       int
 
 	// Circuit Breaker
-	CBThreshold         int // failure % to trip breaker
-	CBWindow            int // number of requests in sliding window
-	CBOpenDurationMin   int // minutes circuit stays OPEN
+	CBThreshold       int // failure % to trip breaker
+	CBWindow          int // number of requests in sliding window
+	CBOpenDurationMin int // minutes circuit stays OPEN
+
+	// Auth & OAuth
+	JWTSecret          string
+	AppURL             string // Frontend dashboard URL for redirects
+	APIBaseURL         string // API Base URL for OAuth callbacks
+	GitHubClientID     string
+	GitHubClientSecret string
+	GoogleClientID     string
+	GoogleClientSecret string
 }
 
 // Load reads environment variables (from .env if present) and returns a Config.
@@ -63,6 +72,14 @@ func Load() *Config {
 		CBThreshold:       getEnvInt("CIRCUIT_BREAKER_THRESHOLD", 50),
 		CBWindow:          getEnvInt("CIRCUIT_BREAKER_WINDOW", 100),
 		CBOpenDurationMin: getEnvInt("CIRCUIT_BREAKER_OPEN_DURATION_MIN", 15),
+
+		JWTSecret:          getEnv("JWT_SECRET", "webhook-gateway-jwt-secret-key-32bytes-min"),
+		AppURL:             getEnv("APP_URL", "http://localhost:3000"),
+		APIBaseURL:         getEnv("API_BASE_URL", "http://localhost:8080"),
+		GitHubClientID:     getEnv("GITHUB_CLIENT_ID", ""),
+		GitHubClientSecret: getEnv("GITHUB_CLIENT_SECRET", ""),
+		GoogleClientID:     getEnv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret: getEnv("GOOGLE_CLIENT_SECRET", ""),
 	}
 }
 

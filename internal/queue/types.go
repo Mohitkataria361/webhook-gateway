@@ -21,6 +21,7 @@ const (
 type WebhookJob struct {
 	EventID        string          `json:"event_id"`
 	EndpointID     string          `json:"endpoint_id"`
+	UserID         string          `json:"user_id"`
 	TargetURL      string          `json:"target_url"`
 	SecretKey      string          `json:"secret_key"`
 	EventType      string          `json:"event_type"`

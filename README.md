@@ -80,26 +80,53 @@ go run tests/mock_receiver/main.go
 
 ---
 
+---
+
 ## 📡 API Reference
 
-### Register Endpoint
+### Authentication & OAuth
 
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/auth/config` | Returns available OAuth providers (`github`, `google`, `dev`) |
+| `GET` | `/api/v1/auth/github` | Redirects to GitHub OAuth authorization |
+| `GET` | `/api/v1/auth/github/callback` | Exchanges code, creates user session, redirects to dashboard |
+| `GET` | `/api/v1/auth/google` | Redirects to Google OAuth authorization |
+| `GET` | `/api/v1/auth/google/callback` | Exchanges code, creates user session, redirects to dashboard |
+| `POST` | `/api/v1/auth/dev-login` | Instant one-click demo login for development and testing |
+| `GET` | `/api/v1/auth/me` | Returns current user profile (requires Bearer token) |
+
+### User-Isolated Hooks & Webhooks (Requires `Authorization: Bearer <token>`)
+
+#### Register Endpoint ("Hook")
 ```bash
 POST /api/v1/endpoints
+Authorization: Bearer <token>
 Content-Type: application/json
 
 {
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
   "target_url": "http://localhost:9090/ok"
 }
 ```
+*Response*: `201 Created` — includes `secret_key` (shown once for HMAC signing). Automatically scoped to the authenticated user.
 
-Response: `201 Created` — includes `secret_key` (store this, shown once).
+#### List My Endpoints
+```bash
+GET /api/v1/endpoints
+Authorization: Bearer <token>
+```
+*Response*: Returns only the endpoints owned by the authenticated user.
 
-### Send Webhook Event
+#### Delete Endpoint
+```bash
+DELETE /api/v1/endpoints/:id
+Authorization: Bearer <token>
+```
 
+#### Send Webhook Event
 ```bash
 POST /api/v1/webhooks/send
+Authorization: Bearer <token>
 Content-Type: application/json
 
 {
@@ -110,37 +137,33 @@ Content-Type: application/json
 }
 ```
 
-Response: `202 Accepted` — event queued asynchronously.
-
-### Get Delivery History
-
+#### Get User Delivery History
 ```bash
-GET /api/v1/events/:id/deliveries
+GET /api/v1/logs
+Authorization: Bearer <token>
 ```
+*Response*: Returns the authenticated user's 100 most recent delivery logs across all their endpoints.
 
-### Replay an Event
-
-```bash
-POST /api/v1/events/:id/replay
+#### WebSocket Live Stream (User Isolated)
+Connect to:
 ```
-
-### WebSocket Live Stream
-
-Connect to `ws://localhost:8080/ws/logs` to receive real-time delivery events in JSON format.
+ws://localhost:8080/ws/logs?token=<jwt_token>
+```
+Receives real-time delivery events **strictly isolated** to the authenticated user's webhook endpoints.
 
 ---
 
 ## 🧪 Running Tests
 
 ```bash
-# Unit tests (no infrastructure required)
-go test ./tests/ -run TestHMAC -v
+# Auth and JWT unit tests
+go test ./tests/ -run "TestJWT|TestOAuth|TestAuthMiddleware" -v
 
-# Integration tests (requires Redis)
-go test ./tests/ -run TestIdempotency -v
+# HMAC signing tests
+go test ./tests/ -run TestSign -v
 
-# All tests
-go test ./...
+# All unit tests
+go test ./tests/...
 ```
 
 ---
@@ -153,16 +176,21 @@ go test ./...
 | `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` | AMQP URL |
 | `REDIS_ADDR` | `localhost:6379` | Redis address |
 | `API_PORT` | `8080` | HTTP server port |
+| `JWT_SECRET` | `webhook-gateway-jwt-secret-key...` | Secret key for signing JWT tokens |
+| `APP_URL` | `http://localhost:3000` | Dashboard frontend URL (for OAuth callbacks) |
+| `API_BASE_URL` | `http://localhost:8080` | Backend API URL |
+| `GITHUB_CLIENT_ID` | `""` | GitHub OAuth App Client ID (optional in dev) |
+| `GITHUB_CLIENT_SECRET` | `""` | GitHub OAuth App Client Secret (optional in dev) |
+| `GOOGLE_CLIENT_ID` | `""` | Google OAuth Client ID (optional in dev) |
+| `GOOGLE_CLIENT_SECRET` | `""` | Google OAuth Client Secret (optional in dev) |
 | `WORKER_CONCURRENCY` | `10` | Number of goroutine workers |
 | `MAX_RETRIES` | `5` | Max delivery attempts before DLQ |
-| `CIRCUIT_BREAKER_THRESHOLD` | `50` | Failure % to open circuit |
-| `CIRCUIT_BREAKER_WINDOW` | `100` | Requests in sliding window |
-| `CIRCUIT_BREAKER_OPEN_DURATION_MIN` | `15` | Minutes circuit stays open |
 
 ---
 
-## 🛡️ Security
+## 🛡️ Security & Multi-Tenancy
 
+- **User Isolation**: Every user owns their endpoints, events, and delivery attempts. WebSockets and API endpoints verify JWT claims and never leak logs to other tenants.
 - **HMAC-SHA256 Signing**: Every outgoing request includes an `X-Signature-256: sha256=<digest>` header. Recipients verify this using their endpoint secret key.
 - **Idempotency Keys**: Redis-backed SETNX prevents duplicate event processing across any number of API replicas.
 - **Secret Key Exposure**: Signing secrets are stored in PostgreSQL but **never returned in GET responses** (only at registration time).

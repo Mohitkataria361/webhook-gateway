@@ -23,7 +23,7 @@ func NewEndpointHandler(db *pgxpool.Pool) *EndpointHandler {
 
 // RegisterRequest is the JSON body for POST /api/v1/endpoints.
 type RegisterRequest struct {
-	UserID    string `json:"user_id"    validate:"required"`
+	UserID    string `json:"user_id,omitempty"` // Optional: automatically overridden by authenticated user
 	TargetURL string `json:"target_url" validate:"required,url"`
 }
 
@@ -38,18 +38,27 @@ type RegisterResponse struct {
 }
 
 // Register handles POST /api/v1/endpoints.
-// Generates a cryptographically random 32-byte secret key for HMAC signing.
+// Automatically associates the endpoint with the authenticated user ID.
 func (h *EndpointHandler) Register(c *fiber.Ctx) error {
 	var req RegisterRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid JSON body"})
 	}
-	if req.UserID == "" || req.TargetURL == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id and target_url are required"})
+
+	// Prefer authenticated user ID from context.
+	var userIDStr string
+	if authUID, ok := c.Locals("user_id").(string); ok && authUID != "" {
+		userIDStr = authUID
+	} else {
+		userIDStr = req.UserID
+	}
+
+	if userIDStr == "" || req.TargetURL == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "target_url is required"})
 	}
 
 	// Validate user_id is a valid UUID.
-	userID, err := uuid.Parse(req.UserID)
+	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id must be a valid UUID"})
 	}
@@ -79,11 +88,18 @@ func (h *EndpointHandler) Register(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(resp)
 }
 
-// List handles GET /api/v1/endpoints?user_id=<uuid>.
+// List handles GET /api/v1/endpoints.
+// Returns endpoints strictly scoped to the authenticated user.
 func (h *EndpointHandler) List(c *fiber.Ctx) error {
-	userIDStr := c.Query("user_id")
+	var userIDStr string
+	if authUID, ok := c.Locals("user_id").(string); ok && authUID != "" {
+		userIDStr = authUID
+	} else {
+		userIDStr = c.Query("user_id")
+	}
+
 	if userIDStr == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id query param required"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "user_id query param or auth required"})
 	}
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -120,4 +136,36 @@ func (h *EndpointHandler) List(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"endpoints": endpoints, "count": len(endpoints)})
+}
+
+// Delete handles DELETE /api/v1/endpoints/:id.
+// Deletes an endpoint owned by the authenticated user.
+func (h *EndpointHandler) Delete(c *fiber.Ctx) error {
+	endpointIDStr := c.Params("id")
+	endpointID, err := uuid.Parse(endpointIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid endpoint id"})
+	}
+
+	userIDStr, ok := c.Locals("user_id").(string)
+	if !ok || userIDStr == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id"})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := h.db.Exec(ctx, "DELETE FROM webhook_endpoints WHERE id = $1 AND user_id = $2", endpointID, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if res.RowsAffected() == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "endpoint not found or not owned by user"})
+	}
+
+	return c.JSON(fiber.Map{"status": "deleted", "id": endpointIDStr})
 }

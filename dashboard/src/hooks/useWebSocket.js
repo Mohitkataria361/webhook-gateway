@@ -4,15 +4,9 @@
  * and streams delivery log events isolated to the current user.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getLogs } from '../api/webhookApi';
+import { getLogs, getWebSocketUrl } from '../api/webhookApi';
 
-const getWsUrl = (token) => {
-  const base = import.meta.env.VITE_WS_URL || (() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${window.location.host}/ws/logs`;
-  })();
-  return `${base}?token=${encodeURIComponent(token)}`;
-};
+const getWsUrl = (token) => getWebSocketUrl(token);
 
 export function useWebSocket(token) {
   const [logs, setLogs] = useState([]);

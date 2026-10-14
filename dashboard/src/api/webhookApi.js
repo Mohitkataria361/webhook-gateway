@@ -1,7 +1,52 @@
 import axios from 'axios';
 
+// Resolve base API URL:
+// 1. Explicit environment variable (VITE_API_URL)
+// 2. Fallback for deployed Render app (webhook-gateway-1.onrender.com -> backend webhook-gateway-ciq7.onrender.com)
+// 3. Fallback to '/api/v1' for local dev with Vite proxy or same-origin deployments
+export const getApiBaseUrl = () => {
+  const envUrl = import.meta.env.VITE_API_URL;
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, '');
+  }
+  if (typeof window !== 'undefined' && window.location.hostname.includes('webhook-gateway-1.onrender.com')) {
+    return 'https://webhook-gateway-ciq7.onrender.com/api/v1';
+  }
+  return '/api/v1';
+};
+
+export const getBackendBaseUrl = () => {
+  const apiBase = getApiBaseUrl();
+  if (apiBase.startsWith('http://') || apiBase.startsWith('https://')) {
+    return apiBase.replace(/\/api\/v1\/?$/, '');
+  }
+  return '';
+};
+
+export const getOAuthUrl = (provider) => {
+  const apiBase = getApiBaseUrl();
+  if (apiBase.startsWith('http://') || apiBase.startsWith('https://')) {
+    const normalized = apiBase.endsWith('/api/v1') ? apiBase : `${apiBase}/api/v1`;
+    return `${normalized}/auth/${provider}`;
+  }
+  return `/api/v1/auth/${provider}`;
+};
+
+export const getWebSocketUrl = (token) => {
+  if (import.meta.env.VITE_WS_URL) {
+    return `${import.meta.env.VITE_WS_URL}?token=${encodeURIComponent(token)}`;
+  }
+  const backend = getBackendBaseUrl();
+  if (backend) {
+    const wsBase = backend.replace(/^http/, 'ws');
+    return `${wsBase}/ws/logs?token=${encodeURIComponent(token)}`;
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/logs?token=${encodeURIComponent(token)}`;
+};
+
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || '/api/v1',
+  baseURL: getApiBaseUrl(),
   headers: { 'Content-Type': 'application/json' },
 });
 
@@ -38,9 +83,7 @@ export const generateApiKey = (userId) =>
   api.post('/auth/keys', userId ? { user_id: userId } : {});
 
 export const adminGenerateKey = (userId) => {
-  const base = import.meta.env.VITE_API_URL
-    ? import.meta.env.VITE_API_URL.replace(/\/api\/v1\/?$/, '')
-    : '';
+  const base = getBackendBaseUrl();
   return axios.post(`${base}/api/admin/generate-key`, userId ? { user_id: userId } : {});
 };
 

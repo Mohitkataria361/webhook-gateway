@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getAuthConfig, devLogin } from '../api/webhookApi';
+import { getAuthConfig, devLogin, getOAuthUrl } from '../api/webhookApi';
 
 export default function LoginView({ onLoginSuccess, authError }) {
   const [authConfig, setAuthConfig] = useState({ github_enabled: false, google_enabled: false, dev_enabled: true });
@@ -16,7 +16,9 @@ export default function LoginView({ onLoginSuccess, authError }) {
   useEffect(() => {
     getAuthConfig()
       .then(({ data }) => setAuthConfig(data))
-      .catch(() => {});
+      .catch((err) => {
+        console.warn('Could not load auth config from server:', err);
+      });
   }, []);
 
   const handleAuthSubmit = async (e) => {
@@ -99,7 +101,7 @@ export default function LoginView({ onLoginSuccess, authError }) {
         {/* ── OAuth 1-Click Providers ── */}
         <div className="oauth-section">
           <a
-            href="/api/v1/auth/github"
+            href={getOAuthUrl('github')}
             className="oauth-btn oauth-github"
             title={authConfig.github_enabled ? 'Authenticate with GitHub' : 'Configure GITHUB_CLIENT_ID and SECRET in .env'}
           >
@@ -111,7 +113,7 @@ export default function LoginView({ onLoginSuccess, authError }) {
           </a>
 
           <a
-            href="/api/v1/auth/google"
+            href={getOAuthUrl('google')}
             className="oauth-btn oauth-google"
             title={authConfig.google_enabled ? 'Authenticate with Google' : 'Configure GOOGLE_CLIENT_ID and SECRET in .env'}
           >

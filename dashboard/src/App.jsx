@@ -301,7 +301,9 @@ export default function App() {
             {sendResult && (
               <div className="result-box result-success animate-fade">
                 ✓ Event Accepted & Queued: <strong>{sendResult.event_id}</strong>
-                <p className="text-xs text-muted mt-1">Status: PENDING. Worker is processing with HMAC signature.</p>
+                <p className="text-xs text-muted mt-1">
+                  Status: PENDING (enqueued into RabbitMQ). Check the <strong>Live Delivery Log</strong> table below to watch the worker dispatch with HMAC signature in real-time.
+                </p>
               </div>
             )}
             {sendError && <div className="result-box result-error">✗ {sendError}</div>}

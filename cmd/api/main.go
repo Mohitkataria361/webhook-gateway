@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"webhook-gateway/internal/hub"
 	"webhook-gateway/internal/queue"
 	redisclient "webhook-gateway/internal/redis"
+	"webhook-gateway/internal/worker"
 )
 
 func main() {
@@ -57,6 +59,31 @@ func main() {
 	// --- Create WebSocket Hub with Redis Pub/Sub ---
 	h := hub.New(rc.Raw())
 
+	// --- Start Background Delivery Worker Pool ---
+	// Automatically starts an embedded worker pool unless explicitly disabled.
+	// This ensures single-container deployments (e.g. Render, Railway, Docker)
+	// and local dev automatically process webhook queues without requiring a separate service.
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+
+	if os.Getenv("DISABLE_EMBEDDED_WORKER") != "true" {
+		workerMQ, err := queue.New(cfg.RabbitMQURL)
+		if err != nil {
+			log.Printf("[api] Warning: could not open dedicated worker AMQP connection: %v (falling back to shared mq)", err)
+			workerMQ = mq
+		} else {
+			defer workerMQ.Close()
+		}
+
+		workerPool := worker.NewPool(cfg.WorkerConcurrency, pool, rc, workerMQ, h)
+		go func() {
+			log.Printf("[api] Started background delivery worker pool (concurrency: %d)", cfg.WorkerConcurrency)
+			if err := workerPool.Start(workerCtx); err != nil && err != context.Canceled {
+				log.Printf("[api] Embedded worker error: %v", err)
+			}
+		}()
+	}
+
 	// --- Set up and start Fiber ---
 	app := api.SetupRouter(pool, rc, mq, h, cfg)
 
@@ -66,7 +93,8 @@ func main() {
 
 	go func() {
 		<-quit
-		log.Println("[api] Shutting down server...")
+		log.Println("[api] Shutting down server and worker pool...")
+		workerCancel()
 		if err := app.Shutdown(); err != nil {
 			log.Printf("[api] Shutdown error: %v", err)
 		}
